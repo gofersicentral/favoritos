@@ -10,13 +10,14 @@ app.use(express.json());
 // ==========================================
 // 1. Inicialização do Banco de Dados em Nuvem (Neon Serverless)
 // ==========================================
+const dbUrl = process.env.POSTGRES_URL || process.env.DATABASE_URL;
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
+  connectionString: dbUrl
 });
 
 // Criar tabela se não existir (Executa apenas na primeira carga)
 async function initDB() {
-    if (!process.env.DATABASE_URL) {
+    if (!dbUrl) {
         console.warn('⚠️ DATABASE_URL não configurada! A Vercel/Neon precisa dessa chave.');
         return;
     }
