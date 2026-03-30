@@ -1,83 +1,121 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('@neondatabase/serverless');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ==========================================
-// 1. Inicialização do Banco de Dados
+// 1. Inicialização do Banco de Dados em Nuvem (Neon Serverless)
 // ==========================================
-const db = new sqlite3.Database('./wishlist.db', (err) => {
-    if (err) console.error('Erro ao abrir o banco de dados:', err);
-    else console.log('✅ Conectado ao banco de dados SQLite.');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
 });
 
-db.serialize(() => {
-    db.run(`
-        CREATE TABLE IF NOT EXISTS wishlists (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            store_id TEXT,
-            customer_id TEXT,
-            product_id TEXT,
-            product_data TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-});
+// Criar tabela se não existir (Executa apenas na primeira carga)
+async function initDB() {
+    if (!process.env.DATABASE_URL) {
+        console.warn('⚠️ DATABASE_URL não configurada! A Vercel/Neon precisa dessa chave.');
+        return;
+    }
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS wishlists (
+                id SERIAL PRIMARY KEY,
+                store_id VARCHAR(50),
+                customer_id VARCHAR(100),
+                product_id VARCHAR(100),
+                product_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('✅ Banco de dados Neon (Postgres) Serverless conectado e tabela verificada.');
+    } catch (err) {
+        console.error('Erro ao inicializar tabela:', err);
+    }
+}
+initDB();
 
 // ==========================================
-// 2. Rotas do Aplicativo Frontend (Loja)
+// 2. Rotas do Aplicativo Frontend (Nuvemshop)
 // ==========================================
+
+// Ping para testar se a API está no ar
+app.get('/v1/health', (req, res) => {
+    res.json({ status: 'Online!', cloud: 'Vercel Serverless' });
+});
 
 // Ler os favoritos de um cliente
-app.get('/v1/wishlist', (req, res) => {
+app.get('/v1/wishlist', async (req, res) => {
     const customer = req.query.customer;
     if (!customer) return res.status(400).json({ error: 'Customer is required' });
 
-    db.all(`SELECT product_data FROM wishlists WHERE customer_id = ?`, [customer], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        const items = rows.map(r => JSON.parse(r.product_data));
+    try {
+        const result = await pool.query(
+            `SELECT product_data FROM wishlists WHERE customer_id = $1`, 
+            [customer]
+        );
+        const items = result.rows.map(r => JSON.parse(r.product_data));
         res.json(items);
-    });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Salvar um favorito
-app.post('/v1/wishlist', (req, res) => {
+app.post('/v1/wishlist', async (req, res) => {
     const { customer_id, product } = req.body;
     if (!customer_id || !product) return res.status(400).json({ error: 'Customer e Product são obrigatórios' });
 
-    const store_id = "test-store"; // Simulando identificador de loja multi-tenant
+    const store_id = "gofersi-cloud"; // Identificador multi-tenant
 
-    db.get(`SELECT id FROM wishlists WHERE customer_id = ? AND product_id = ?`, [customer_id, product.id], (err, row) => {
-        if (row) return res.json({ success: true, message: 'Já existe' }); // Não duplica
+    try {
+        // Verifica se já existe para este cliente
+        const check = await pool.query(
+            `SELECT id FROM wishlists WHERE customer_id = $1 AND product_id = $2`, 
+            [customer_id, String(product.id)]
+        );
+        if (check.rows.length > 0) {
+            return res.json({ success: true, message: 'Já existe' });
+        }
         
-        db.run(`INSERT INTO wishlists (store_id, customer_id, product_id, product_data) VALUES (?, ?, ?, ?)`, 
-            [store_id, customer_id, product.id, JSON.stringify(product)], function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ success: true, internal_id: this.lastID });
-        });
-    });
+        // Insere se não existir
+        const insert = await pool.query(
+            `INSERT INTO wishlists (store_id, customer_id, product_id, product_data) VALUES ($1, $2, $3, $4) RETURNING id`, 
+            [store_id, customer_id, String(product.id), JSON.stringify(product)]
+        );
+        res.json({ success: true, internal_id: insert.rows[0].id });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Remover um favorito
-app.delete('/v1/wishlist', (req, res) => {
+app.delete('/v1/wishlist', async (req, res) => {
     const { customer_id, product_id } = req.body;
     if (!customer_id || !product_id) return res.status(400).json({ error: 'Faltando campos obrigatórios' });
 
-    db.run(`DELETE FROM wishlists WHERE customer_id = ? AND product_id = ?`, [customer_id, product_id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ success: true, deleted: this.changes });
-    });
+    try {
+        const del = await pool.query(
+            `DELETE FROM wishlists WHERE customer_id = $1 AND product_id = $2`, 
+            [customer_id, String(product_id)]
+        );
+        res.json({ success: true, deleted: del.rowCount });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ==========================================
-// 3. Inicialização do Servidor
+// 3. Exportação para Vercel (Importante Serverless)
 // ==========================================
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-    console.log(`🚀 Gofersi Backend App iniciado com sucesso na porta ${PORT}`);
-    console.log(`Para testes, a API responde em: http://localhost:${PORT}/v1`);
-});
+// A Vercel não inicializa o servidor escutando uma PORTA por padrão, ela exporta o App.
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3001;
+    app.listen(PORT, () => {
+        console.log(`🚀 Gofersi Cloud API iniciada localmente na porta ${PORT}`);
+    });
+}
+module.exports = app;
